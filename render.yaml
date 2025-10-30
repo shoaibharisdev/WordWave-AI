@@ -4,5 +4,5 @@ services:
     env: python
     plan: free
     buildCommand: pip install -r requirements.txt
-    startCommand: gunicorn app:app  # or flask run, depending on your setup
+    startCommand: gunicorn models:app --bind 0.0.0.0:$PORT
     pythonVersion: 3.11.9
