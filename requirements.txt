@@ -1,0 +1,34 @@
+# Core Web Framework
+Flask==3.0.3
+Flask-Cors==4.0.1
+gunicorn
+
+# Deep Learning / Transformers
+torch==2.5.1
+transformers==4.44.2
+
+# Data Handling
+pandas==2.2.2
+numpy==1.26.4
+
+# MongoDB Integration
+pymongo==4.6.3
+certifi==2024.8.30
+
+# NLP and Text Processing
+nltk==3.9.1
+gensim==4.3.3
+vaderSentiment==3.3.2
+scikit-learn==1.5.2
+
+# Environment Management
+python-dotenv==1.0.1
+
+# Utilities
+regex==2024.9.11
+bson==0.5.10
+
+# Threading / Async (built-in, no need to install)
+# time, threading, datetime — standard library
+
+
