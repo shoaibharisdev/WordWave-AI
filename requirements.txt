@@ -1,10 +1,11 @@
 # Core Web Framework
 Flask==3.0.3
 Flask-Cors==4.0.1
-gunicorn
+gunicorn==21.2.0
 
-# Deep Learning / Transformers
-torch==2.5.1
+# Deep Learning / Transformers (CPU-only version to save memory)
+--extra-index-url https://download.pytorch.org/whl/cpu
+torch==2.5.1+cpu
 transformers==4.44.2
 
 # Data Handling
@@ -26,7 +27,3 @@ python-dotenv==1.0.1
 
 # Utilities
 regex==2024.9.11
-# Threading / Async (built-in, no need to install)
-# time, threading, datetime — standard library
-
-

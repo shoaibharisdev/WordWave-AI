@@ -1,6 +1,5 @@
 from flask import Flask, request, jsonify
 import torch
-from transformers import BertTokenizer, BertForSequenceClassification
 from torch.nn.functional import sigmoid
 import pandas as pd
 import pymongo
@@ -21,6 +20,7 @@ from flask_cors import CORS
 import nltk
 import threading
 import time
+import gc
 
 # Initialize Flask app
 app = Flask(__name__)
@@ -30,7 +30,6 @@ CORS(app)
 TRENDING_UPDATE_FREQUENCY = 86400  # Seconds between auto-updates (86400 = 24 hours)
 CACHE_CHECK_INTERVAL = 300         # Seconds between checks (300 = 5 minutes)
 CACHE_EXPIRY_HOURS = 24            # Hours until cache expires (24 = 1 day)
-
 
 # ===== CACHE SETUP =====
 trending_cache = {
@@ -52,7 +51,6 @@ try:
     client = pymongo.MongoClient(MONGO_URI, tlsCAFile=certifi.where())
     db = client[DB_NAME]
     posts_collection = db[COLLECTION_NAME]
-    # Create a separate collection for cached trending topics
     cache_collection = db['trending_cache']
     print("✅ MongoDB connected successfully")
 except Exception as e:
@@ -62,31 +60,51 @@ except Exception as e:
     cache_collection = None
 
 # ===== HATE SPEECH DETECTION SETUP =====
-# Load pre-trained model and tokenizer
-try:
-    tokenizer = BertTokenizer.from_pretrained("unitary/toxic-bert")
-    model = BertForSequenceClassification.from_pretrained("unitary/toxic-bert")
-    model.eval()  # Set the model to evaluation mode
-    print("✅ Hate speech model loaded successfully")
-except Exception as e:
-    print(f"❌ Hate speech model loading failed: {e}")
-    tokenizer = None
-    model = None
+# LAZY LOADING - Model only loads when needed
+model = None
+tokenizer = None
+
+def load_hate_speech_model():
+    """Lazy load the hate speech model only when needed"""
+    global model, tokenizer
+    if model is None or tokenizer is None:
+        try:
+            print("🔄 Loading hate speech model...")
+            from transformers import BertTokenizer, BertForSequenceClassification
+            tokenizer = BertTokenizer.from_pretrained("unitary/toxic-bert")
+            model = BertForSequenceClassification.from_pretrained("unitary/toxic-bert")
+            model.eval()
+            print("✅ Hate speech model loaded successfully")
+        except Exception as e:
+            print(f"❌ Hate speech model loading failed: {e}")
+            return None, None
+    return tokenizer, model
 
 # Define labels for toxic-bert
 TOXIC_LABELS = ["toxic", "severe_toxic", "obscene", "threat", "insult", "identity_hate"]
 
 # ===== SENTIMENT ANALYSIS SETUP =====
-# Initialize VADER sentiment analyzer
 analyzer = SentimentIntensityAnalyzer()
 
 # Initialize TF-IDF Vectorizer
 tfidf_vectorizer = TfidfVectorizer(stop_words='english')
 
 # ===== NLP SETUP =====
-# nltk.download('punkt')
-# nltk.download('stopwords')
-# nltk.download('wordnet')
+# Download NLTK data if not present
+try:
+    nltk.data.find('tokenizers/punkt')
+except LookupError:
+    nltk.download('punkt', quiet=True)
+
+try:
+    nltk.data.find('corpora/stopwords')
+except LookupError:
+    nltk.download('stopwords', quiet=True)
+
+try:
+    nltk.data.find('corpora/wordnet')
+except LookupError:
+    nltk.download('wordnet', quiet=True)
 
 # Define a set of meaningless words to remove
 meaningless_words = {
@@ -96,7 +114,7 @@ meaningless_words = {
     'at', 'back', 'be', 'became', 'because', 'become', 'becomes', 'becoming', 'been', 'before', 'beforehand', 
     'behind', 'being', 'below', 'beside', 'besides', 'between', 'beyond', 'bill', 'both', 'bottom', 'but', 
     'by', 'call', 'can', 'cannot', 'cant', 'co', 'con', 'could', 'couldnt', 'cry', 'de', 'describe', 'detail', 
-    'do', 'done', 'down', 'due', 'during', 'each', 'eg','come','came','coming','live' 'living', 'eight', 'either', 'eleven', 'else', 'elsewhere', 
+    'do', 'done', 'down', 'due', 'during', 'each', 'eg','come','came','coming','live', 'living', 'eight', 'either', 'eleven', 'else', 'elsewhere', 
     'empty', 'enough', 'etc', 'even', 'ever', 'every', 'everyone', 'everything', 'everywhere', 'except', 
     'few', 'fifteen', 'fifty', 'fill', 'find', 'fire', 'first', 'five', 'for', 'former', 'formerly', 'forty', 
     'found', 'four', 'from', 'front', 'full', 'further', 'get', 'give', 'go', 'had', 'has', 'hasnt', 'have', 
@@ -117,40 +135,8 @@ meaningless_words = {
     'we', 'well', 'were', 'what', 'whatever', 'when', 'whence', 'whenever', 'where', 'whereafter', 'whereas', 
     'whereby', 'wherein', 'whereupon', 'wherever', 'whether', 'which', 'while', 'whither', 'who', 'whoever', 
     'whole', 'whom', 'whose', 'why', 'will', 'with', 'within', 'without', 'would', 'yet', 'you', 'your', 
-    'yours', 'yourself', 'yourselves',
-    'theyre', 'their', 'shouldnt', 'wont', 'wouldnt', 'couldnt', 'cant', 'werent', 'arent', 'isnt', 
-    'wasnt', 'havent', 'hasnt', 'hadnt', 'shouldve', 'couldve', 'wouldve', 'mightve', 'mustve', 'theres', 
-    'heres', 'didnt', 'doesnt', 'dont', 'shant', 'shan', 'neither', 'nor', 'its', 'it', 'ill', 'im', 'ive', 
-    'id', 'lets', 'thats', 'whats', 'whose', 'whos', 'shes', 'hes', 'whos', 'youd', 'youve', 'youd', 'youre', 
-    'youll', 'yall', 'yalls', 'couldve', 'wouldve', 'shouldve', 'mightve', 'mustve', 'arent', 'isnt', 'wasnt', 
-    'werent', 'dont', 'doesnt', 'didnt', 'wont', 'cant', 'shouldnt', 'couldnt', 'wouldnt', 'neednt', 'shant', 
-    'shan', 'mustnt', 'theres', 'heres', 'wheres', 'whens', 'whys', 'hows', 'lets', 'used', 'using', 'use', 
-    'many', 'much', 'a', 'an', 'some', 'any', 'more', 'most', 'all', 'both', 'every', 'either', 'neither', 
-    'each', 'few', 'several', 'no', 'other', 'another', 'such', 'that', 'these', 'those', 'this', 'one', 'once', 
-    'twice', 'and', 'but', 'or', 'nor', 'for', 'so', 'yet', 'not', 'only', 'with', 'without', 'also', 'too', 
-    'very', 'just', 'now', 'then', 'than', 'even', 'ever', 'already', 'still', 'almost', 'often', 'sometimes', 
-    'usually', 'always', 'never', 'perhaps', 'maybe', 'possibly', 'probably', 'really', 'quite', 'rather', 'so', 
-    'such', 'too', 'enough', 'very', 'indeed', 'less', 'more', 'a lot', 'lots', 'kind of', 'sort of', 'seem', 
-    'seems', 'appear', 'appears', 'might', 'may', 'must', 'should', 'could', 'would', 'ought', 'shall', 'will', 
-    'can', 'cannot', 'couldnt', 'wouldnt', 'shouldnt', 'heres', 'theres', 'wheres', 'whens', 'whys', 'hows', 
-    'they', 'he', 'she', 'we', 'you', 'theyre', 'im', 'youre', 'hes', 'shes', 'its', 'its', 'theyll', 'weve', 
-    'theyve', 'couldve', 'wouldve', 'shouldve', 'mightve', 'mustve', 'youll', 'ive', 'youd', 'weve', 'theyve', 
-    'youve', 'youd', 'id', 'would', 'could', 'should', 'might', 'must', 'did', 'does', 'do', 'dont', 'didnt', 
-    'doesnt', 'doest', 'arent', 'isnt', 'wasnt', 'werent', 'havent', 'hasnt', 'hadnt', 'havent', 'hasnt', 
-    'hadnt', 'wont', 'wont', 'dont', 'doesnt', 'didnt', 'dont', 'doesnt', 'didnt', 'shant', 'shan', 'neednt', 
-    'mustnt', 'oughtnt', 'thats', 'whos', 'thats', 'whats', 'whos', 'whats', 'whos', 'thats', 'whats', 'whos', 
-    'couldnt', 'wouldnt', 'shouldnt', 'mightnt', 'mustnt', 'shant', 'shouldnt', 'wouldnt', 'couldnt', 'wont', 
-    'shall', 'should', 'shouldnt', 'ought', 'would', 'might', 'may', 'maynt', 'mightnt', 'must', 'mustnt', 
-    'need', 'neednt', 'ought', 'oughtnt', 'shall', 'shant', 'should', 'shouldnt', 'will', 'wont', 'would', 
-    'wouldnt', 'must', 'mustnt', 'may', 'might', 'mightnt', 'may', 'might', 'must', 'ought', 'oughtnt', 'shall', 
-    'shant', 'should', 'shouldnt', 'will', 'wont', 'would', 'wouldnt', 'can', 'cant', 'could', 'couldnt', 
-    'may', 'might', 'mightnt', 'must', 'mustnt', 'ought', 'oughtnt', 'shall', 'should', 'want','shouldnt', 'will', 
-    'wont', 'would', 'wouldnt', 'need', 'neednt', 'dare', 'dares', 'daren', 'darent', 'shall', 'should', 
-    'shouldnt', 'will', 'wont', 'would', 'wouldnt', 'can', 'cant', 'could', 'couldnt', 'may', 'might', 
-    'mightnt', 'must', 'mustnt', 'ought', 'oughtnt', 'shall', 'shant', 'should', 'shouldnt', 'will', 'wont', 
-    'would', 'wouldnt', 'need', 'neednt', 'dare', 'dares', 'daren', 'darent', 'ought', 'oughtnt', 'need', 
-    'neednt', 'dare', 'dares', 'daren', 'darent', 'cant', 'cannot', 'cant', 'cannot', 'cant', 'cannot', 'cannot', 
-    'cant', 'cannot'}
+    'yours', 'yourself', 'yourselves', 'want', 'used', 'using', 'use'
+}
 
 # ===== HELPER FUNCTIONS =====
 
@@ -160,50 +146,53 @@ def predict_hate_speech(text):
     Predict if text contains hate speech using toxic-bert model.
     This model is multi-label, so we use sigmoid activation and thresholds.
     """
-    if tokenizer is None or model is None:
+    tokenizer_local, model_local = load_hate_speech_model()
+    
+    if tokenizer_local is None or model_local is None:
         return {"error": "Hate speech model not available"}
     
-    inputs = tokenizer(text, return_tensors="pt", truncation=True, padding=True, max_length=128)
-    
-    with torch.no_grad():
-        outputs = model(**inputs)
-        # Use sigmoid for multi-label classification (not softmax)
-        probabilities = sigmoid(outputs.logits)
-    
-    # Set threshold for toxicity detection (adjust between 0.3-0.7 based on your needs)
-    # Lower threshold = more strict, Higher threshold = more lenient
-    threshold = 0.5
-    
-    # Get predictions for each toxic category
-    predictions = probabilities[0].tolist()
-    detected_categories = []
-    max_confidence = 0.0
-    
-    for i, label in enumerate(TOXIC_LABELS):
-        if predictions[i] > threshold:
-            detected_categories.append({
-                "label": label,
-                "confidence": round(predictions[i], 3)
-            })
-            max_confidence = max(max_confidence, predictions[i])
-    
-    is_hate = len(detected_categories) > 0
-    
-    # Determine primary category
-    if is_hate:
-        primary_category = max(detected_categories, key=lambda x: x['confidence'])
-        classification = primary_category['label']
-    else:
-        classification = "Not classified as any category"
-    
-    return {
-        "hate_speech": is_hate,
-        "classification": classification,
-        "confidence": round(max_confidence, 3) if is_hate else 0.0,
-        "detected_categories": detected_categories
-    }
+    try:
+        inputs = tokenizer_local(text, return_tensors="pt", truncation=True, padding=True, max_length=128)
+        
+        with torch.no_grad():
+            outputs = model_local(**inputs)
+            probabilities = sigmoid(outputs.logits)
+        
+        threshold = 0.5
+        predictions = probabilities[0].tolist()
+        detected_categories = []
+        max_confidence = 0.0
+        
+        for i, label in enumerate(TOXIC_LABELS):
+            if predictions[i] > threshold:
+                detected_categories.append({
+                    "label": label,
+                    "confidence": round(predictions[i], 3)
+                })
+                max_confidence = max(max_confidence, predictions[i])
+        
+        is_hate = len(detected_categories) > 0
+        
+        if is_hate:
+            primary_category = max(detected_categories, key=lambda x: x['confidence'])
+            classification = primary_category['label']
+        else:
+            classification = "Not classified as any category"
+        
+        # Clean up
+        del inputs, outputs, probabilities
+        gc.collect()
+        
+        return {
+            "hate_speech": is_hate,
+            "classification": classification,
+            "confidence": round(max_confidence, 3) if is_hate else 0.0,
+            "detected_categories": detected_categories
+        }
+    except Exception as e:
+        return {"error": f"Prediction failed: {str(e)}"}
 
-# Trending Topics Functions - UPDATED WITH CACHING
+# Trending Topics Functions
 def get_mongo_data(hours_back=730):
     """Get recent data from MongoDB for trending topics"""
     if posts_collection is None:
@@ -223,7 +212,6 @@ def preprocess_text(text):
     text = text.lower()
     text = re.sub(r'[^a-zA-Z\s]', '', text)
     stop_words = set(stopwords.words('english'))
-    # Remove meaningless words
     stop_words.update(meaningless_words)
     text = " ".join([word for word in word_tokenize(text) if word not in stop_words and len(word) > 3])
     lemmatizer = WordNetLemmatizer()
@@ -246,7 +234,7 @@ def create_pattern_from_top_words_with_synonyms(lda_model, topic_id, topn=1):
     return pattern
 
 def calculate_trending_topics():
-    """Calculate trending topics (the expensive operation) - ORIGINAL LOGIC"""
+    """Calculate trending topics (the expensive operation)"""
     print("🔄 Calculating trending topics...")
     start_time = time.time()
     
@@ -257,15 +245,11 @@ def calculate_trending_topics():
     
     df_twitter_recent = pd.DataFrame(recent_data)
     
-    # Check if 'text' column exists
     if 'text' not in df_twitter_recent.columns:
         print("❌ No 'text' column in data")
         return []
     
-    # Apply preprocessing to the 'text' column
     df_twitter_recent['processed_text'] = df_twitter_recent['text'].apply(preprocess_text)
-    
-    # Filter out empty processed texts
     df_twitter_recent = df_twitter_recent[df_twitter_recent['processed_text'].str.len() > 0]
     
     if len(df_twitter_recent) == 0:
@@ -273,33 +257,33 @@ def calculate_trending_topics():
         return []
 
     try:
-        # Create a dictionary and corpus for LDA analysis
         texts = df_twitter_recent['processed_text'].str.split().tolist()
         dictionary = corpora.Dictionary(texts)
         corpus = [dictionary.doc2bow(text) for text in texts]
 
-        # Train the LDA model
         lda_model = models.LdaMulticore(corpus=corpus, id2word=dictionary, num_topics=10, passes=10)
 
         topics_info = []
         for i in range(10):
             topic_words = lda_model.show_topic(i, topn=1)
-            if topic_words:  # Check if topic_words is not empty
+            if topic_words:
                 topic_words = [word for word in topic_words if len(word[0]) > 3]  
                 if topic_words:
                     pattern = create_pattern_from_top_words_with_synonyms(lda_model, i)
                     regex = re.compile(pattern)
 
-                    # Identify related posts using the compiled regex pattern
                     related_posts = [post for post in df_twitter_recent['processed_text'] if regex.search(post)]
                     
-                    # Only include topics with more than 1 related post
                     if len(related_posts) > 1:
                         topics_info.append({
                             "Topic": topic_words[0][0],
                             "Number of Related Posts": len(related_posts),
-                            "Related Posts": related_posts[:5]  # Limit sample size
+                            "Related Posts": related_posts[:5]
                         })
+
+        # Clean up memory
+        del df_twitter_recent, texts, dictionary, corpus, lda_model
+        gc.collect()
 
         processing_time = time.time() - start_time
         print(f"✅ Trending topics calculated in {processing_time:.2f}s. Found {len(topics_info)} topics.")
@@ -318,7 +302,7 @@ def save_topics_to_cache(topics):
             'type': 'trending_topics',
             'topics': topics,
             'created_at': datetime.now(),
-            'expires_at': datetime.now() + timedelta(hours=CACHE_EXPIRY_HOURS)  # Uses config
+            'expires_at': datetime.now() + timedelta(hours=CACHE_EXPIRY_HOURS)
         }
         cache_collection.replace_one(
             {'type': 'trending_topics'},
@@ -352,7 +336,7 @@ def update_trending_topics():
     trending_cache['is_updating'] = True
     try:
         topics = calculate_trending_topics()
-        if topics:  # Only update if we got valid topics
+        if topics:
             trending_cache['topics'] = topics
             trending_cache['last_updated'] = datetime.now()
             save_topics_to_cache(topics)
@@ -364,13 +348,11 @@ def update_trending_topics():
     finally:
         trending_cache['is_updating'] = False
 
-# Background scheduler using simple threading (no external dependencies)
 def background_trending_updater():
-    """Background job to update trending topics every hour"""
+    """Background job to update trending topics"""
     print("🔄 Background trending updater started")
     while True:
         try:
-            # Check if it's time to update (every hour)
             current_time = datetime.now()
             if (trending_cache['last_updated'] is None or 
                 (current_time - trending_cache['last_updated']).total_seconds() >= TRENDING_UPDATE_FREQUENCY):
@@ -379,29 +361,24 @@ def background_trending_updater():
                     print("🔄 Auto-updating trending topics...")
                     update_trending_topics()
             
-            # Sleep for 5 minutes before checking again
             time.sleep(CACHE_CHECK_INTERVAL)
             
         except Exception as e:
             print(f"❌ Background updater error: {e}")
-            time.sleep(CACHE_CHECK_INTERVAL)  
+            time.sleep(CACHE_CHECK_INTERVAL)
 
-# Start background thread
 def initialize_background_services():
     """Initialize background services on startup"""
     print("🔄 Initializing background services...")
     
-    # Try to load from cache first
     cached_topics = load_topics_from_cache()
     if cached_topics:
         trending_cache['topics'] = cached_topics
         trending_cache['last_updated'] = datetime.now()
         print("✅ Loaded trending topics from cache")
     else:
-        # Calculate initial topics
         update_trending_topics()
     
-    # Start background scheduler thread
     scheduler_thread = threading.Thread(target=background_trending_updater, daemon=True)
     scheduler_thread.start()
     print("✅ Background services started")
@@ -514,15 +491,12 @@ def fetch_user_content(user_id):
         user_id_obj = ObjectId(user_id)
         content = []
         
-        # User's own posts
         user_posts = posts_collection.find({"postedBy": user_id_obj})
         content.extend(post.get("text", "") for post in user_posts if post.get("text"))
         
-        # Posts user liked
         liked_posts = posts_collection.find({"likes": user_id_obj})
         content.extend(post.get("text", "") for post in liked_posts if post.get("text"))
         
-        # User's replies
         replies = posts_collection.find({"replies.userId": user_id_obj})
         for post in replies:
             for reply in post.get("replies", []):
@@ -582,7 +556,7 @@ def filter_negative_posts(post_ids):
             if post:
                 text = post.get('text', '')
                 sentiment_scores = analyzer.polarity_scores(text)
-                if sentiment_scores['compound'] >= 0:  # Check if compound score is non-negative
+                if sentiment_scores['compound'] >= 0:
                     filtered_posts.append(post_id)
         except Exception as e:
             print(f"Error filtering post {post_id}: {e}")
@@ -591,7 +565,6 @@ def filter_negative_posts(post_ids):
 
 # ===== ROUTES =====
 
-# Hate Speech Detection Endpoints
 @app.route('/api/hate-speech/predict', methods=['POST'])
 def predict_hate_speech_endpoint():
     """ API endpoint for hate speech prediction """
@@ -607,24 +580,20 @@ def predict_hate_speech_endpoint():
 @app.route('/api/hate-speech/health', methods=['GET'])
 def hate_speech_health():
     """ Health check endpoint for hate speech detection """
-    status = "ok" if tokenizer and model else "error"
-    return jsonify({'status': status, 'model': 'toxic-bert'})
+    status = "ready" if model is None else "loaded"
+    return jsonify({'status': status, 'model': 'toxic-bert (lazy-loaded)'})
 
-# Trending Topics Endpoints - UPDATED WITH CACHING
 @app.route('/api/trending', methods=['GET'])
 def get_trending_topics():
-    """Get trending topics from cache - instant response with ORIGINAL FORMAT"""
+    """Get trending topics from cache - instant response"""
     try:
-        # Optional: force refresh parameter
         force_refresh = request.args.get('refresh', '').lower() == 'true'
         
         if force_refresh and not trending_cache['is_updating']:
-            # Trigger async update
             update_thread = threading.Thread(target=update_trending_topics, daemon=True)
             update_thread.start()
-            return jsonify(trending_cache['topics'])  # Return current cache immediately
+            return jsonify(trending_cache['topics'])
         
-        # Return cached topics instantly - SAME FORMAT AS ORIGINAL
         return jsonify(trending_cache['topics'])
         
     except Exception as e:
@@ -644,7 +613,6 @@ def refresh_trending_topics():
         "current_topics": trending_cache['topics']
     })
 
-# Recommendation Endpoints
 @app.route('/api/recommendations/<user_id>', methods=['GET'])
 def get_user_sentiments_and_top_posts(user_id):
     """Get recommendations based on user sentiments and interactions"""
@@ -652,7 +620,6 @@ def get_user_sentiments_and_top_posts(user_id):
         return jsonify({"error": "Database not available"}), 500
     
     try:
-        # Validate user_id format
         if not ObjectId.is_valid(user_id):
             return jsonify({"error": "Invalid user ID format"}), 400
         
@@ -684,12 +651,11 @@ def get_user_sentiments_and_top_posts(user_id):
     except Exception as e:
         return jsonify({"error": f"Error generating recommendations: {str(e)}"}), 500
 
-# General Health Endpoint
 @app.route('/api/health', methods=['GET'])
 def health():
     """ Overall health check endpoint """
     db_status = "connected" if db else "disconnected"
-    model_status = "loaded" if tokenizer and model else "error"
+    model_status = "loaded" if model else "ready (lazy-load)"
     
     return jsonify({
         'status': 'ok', 
@@ -710,20 +676,22 @@ def health():
 def home():
     """ Home endpoint with API information """
     return jsonify({
-        "message": "Combined API Server",
+        "message": "Combined API Server - Memory Optimized",
         "endpoints": {
             "hate_speech_detection": {
                 "predict": "POST /api/hate-speech/predict",
                 "health": "GET /api/hate-speech/health"
             },
-            "trending_topics": "GET /api/trending",
+            "trending_topics": {
+                "get": "GET /api/trending",
+                "refresh": "POST /api/trending/refresh"
+            },
             "recommendations": "GET /api/recommendations/<user_id>",
             "health": "GET /api/health"
         }
     })
 
 if __name__ == '__main__':
-    # Initialize background services before starting the app
     initialize_background_services()
-    port = int(os.environ.get("PORT", 5000))
+    port = int(os.environ.get("PORT", 8000))
     app.run(host="0.0.0.0", port=port)
