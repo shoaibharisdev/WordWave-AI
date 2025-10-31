@@ -261,8 +261,7 @@ def calculate_trending_topics():
         dictionary = corpora.Dictionary(texts)
         corpus = [dictionary.doc2bow(text) for text in texts]
 
-        lda_model = models.LdaMulticore(corpus=corpus, id2word=dictionary, num_topics=10, passes=10)
-
+        lda_model = models.LdaModel(corpus=corpus, id2word=dictionary, num_topics=10, passes=10)
         topics_info = []
         for i in range(10):
             topic_words = lda_model.show_topic(i, topn=1)
